@@ -29,6 +29,7 @@ var ifaceTmpl = template.Must(
 		Funcs(template.FuncMap{
 			"CalledWithAppend": getCalledWithAppend,
 			"CalledWithType":   getCalledWithType,
+			"ExportTypes":      exportSignatureTypes,
 			"FuncName":         funcName,
 			"GetInputStruct":   getInputStruct,
 			"Params":           getParams,
@@ -125,6 +126,9 @@ const captureRequestParams = `\((.+)\)\s+.+$`
 
 var reCaptureRequestParams = regexp.MustCompile(captureRequestParams)
 
+// FIXME: https://go.dev/play/p/I5GRnC_cBGK.go
+var reCaptureSignatureParts = regexp.MustCompile(`^([A-Z][a-zA-Z0-9_]+)\((.+)?\)\s+\(?(.+)?\)?\s*$`)
+
 var returnsVoid = func() func(string) bool {
 	re := regexp.MustCompile(`\(.*\)\s.+$`)
 	return func(sig string) bool {
@@ -134,7 +138,7 @@ var returnsVoid = func() func(string) bool {
 
 func funcName(sig string) string { return reCaptureFuncName.FindStringSubmatch(sig)[1] }
 
-func getCalledWithType(sig, pkg string) string {
+func getCalledWithType(sig string) string {
 	matches := reCaptureRequestParams.FindStringSubmatch(sig)
 	if len(matches) == 0 {
 		return ""
@@ -238,4 +242,9 @@ func splitParams(s string) []string {
 func splitParam(s string) (p, t string) {
 	parts := strings.Split(strings.TrimSpace(s), " ")
 	return parts[0], parts[1]
+}
+
+// TODO
+func exportSignatureTypes(sig, pkg string) string {
+	return ""
 }
