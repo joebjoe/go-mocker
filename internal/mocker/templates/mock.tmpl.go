@@ -1,45 +1,29 @@
 package mock
-{{$mockType := .Type}}
-{{$pkgName := .Package}}
-type I{{$mockType}} interface {
-{{- range .Methods }}
-	{{.}}
-{{- end}}
-}
 
-type Mock{{$mockType}} struct {
-{{- range .Methods }}
-{{ $fname := FuncName .}}
-{{$sig := ExportTypes . $pkgName}}
-{{- $calledWithType := CalledWithType .}}
-	{{$fname}}CalledTimes int
-{{- if ne $calledWithType ""}}
-	{{$fname}}CalledWith []{{$calledWithType}}
-{{- end}}
-{{- $isVoid := ReturnsVoid .}}
-{{- if not $isVoid}}
-	Mock{{$fname}} func{{TrimPrefix . $fname}}
-{{- end}}
+{{$mockName := MockName .Package .Type}}
+// {{$mockName}} ...
+type {{$mockName}} struct {
+{{- range .Methods}}
+
+	{{.Name}}CalledTimes int
+	{{.Name}}CalledWith []{{- if gt (len .RequestParams) 1 -}}{{.Name}}Input{{- else}}{{ (index .RequestParams 0).Type }}{{- end}}
+	Mock{{.Name}} func{{.RequestParams}} {{.ResponseParams}}
 {{- end}}
 }
 
 {{- range .Methods}}
-{{$fname := FuncName .}}
-{{$sig := ExportTypes . $pkgName}}
-func (m *Mock{{$mockType}}) {{.}} {
-	m.{{$fname}}CalledTimes++
-	{{$calledWithAppend := CalledWithAppend .}}
-{{- if ne $calledWithAppend ""}}
-	m.{{$fname}}CalledWith = append(m.{{$fname}}CalledWith, {{$calledWithAppend}})
-{{- end}}
-{{- $returnsVoid := ReturnsVoid .}}
-{{- if not $returnsVoid}}
-	return m.Mock{{$fname}}({{Params .}})
-{{- end}}
-} 
-{{- end}}
+{{ if gt (len .RequestParams) 1 -}}
+// {{.Name}}Input ...
+type {{.Name}}Input struct {
+	{{ToInputFieldDefinitions .RequestParams}}
+}
+{{ end}}
 
-{{- range .Methods }}
-{{$sig := ExportTypes . $pkgName}}
-{{GetInputStruct .}}
-{{- end}}
+// {{.Name}} ...
+func (m *{{$mockName}}) {{.Name}}{{.RequestParams}} {{.ResponseParams}} {
+	m.{{.Name}}CalledTimes++
+	m.{{.Name}}CalledWith = append(m.{{.Name}}CalledWith, {{ToInputInstance .RequestParams $mockName}})
+	return m.Mock{{.Name}}({{ToParamNameList .RequestParams}})
+}
+
+{{ end}}

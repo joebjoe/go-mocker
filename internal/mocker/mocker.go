@@ -1,69 +1,39 @@
 package mocker
 
 import (
-	"embed"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
 	fslib "io/fs"
-	"os"
+	"os/exec"
 	"regexp"
 	"sort"
-	"strings"
-	"text/template"
 
+	"github.com/joebjoe/go-mocker/internal/api"
 	"github.com/joebjoe/go-mocker/internal/gofs"
 )
 
-const (
-	fmtRegexPackageName     = `package %s`
-	fmtRegexMethodSignature = `(?m)^func \([a-zA-Z][a-zA-Z0-9_]* \*?%s\) ([A-Z][a-zA-Z0-9_]+.*){$`
-)
+type mocker struct{}
 
-//go:embed "templates"
-var tmplFS embed.FS
-
-var isTestFile = regexp.MustCompile(`_test.go$`).MatchString
-var ifaceTmpl = template.Must(
-	template.New("").
-		Funcs(template.FuncMap{
-			"CalledWithAppend": getCalledWithAppend,
-			"CalledWithType":   getCalledWithType,
-			"ExportTypes":      exportSignatureTypes,
-			"FuncName":         funcName,
-			"GetInputStruct":   getInputStruct,
-			"Params":           getParams,
-			"ReturnsVoid":      returnsVoid,
-			"ToLower":          strings.ToLower,
-			"TrimPrefix":       strings.TrimPrefix,
-		}).ParseFS(tmplFS, "templates/mock.tmpl.go"))
-
-type Request struct {
-	Module  string
-	Package string
-	Type    string
-	Methods []string `json:"-"`
+func New() api.Mocker {
+	return &mocker{}
 }
 
-func FindMethods(req Request) (methods []string, err error) {
-	fs, err := gofs.New(req.Module)
-	if err != nil {
-		panic(err)
-	}
-
+func getMethods(fs gofs.FS, req request) (methods []method, err error) {
 	files, err := fslib.Glob(fs, "*.go")
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("failed to locate go files: %w", err)
 	}
 
-	fmt.Println(files)
-	pkgReg, err := regexp.Compile(fmt.Sprintf(fmtRegexPackageName, req.Package))
+	pkgReg, err := regexp.Compile(fmt.Sprintf(patternFmtRegexPackageName, req.Package))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("package '%s' is invalid", req.Package)
 	}
-	isInPackage := pkgReg.Match
 
-	sigReg, err := regexp.Compile(fmt.Sprintf(fmtRegexMethodSignature, req.Type))
+	fileIsInPackage := pkgReg.Match
+
+	sigReg, err := regexp.Compile(fmt.Sprintf(patternFmtRegexMethodSignature, req.Type))
 	if err != nil {
 		return nil, err
 	}
@@ -74,6 +44,7 @@ func FindMethods(req Request) (methods []string, err error) {
 		return matches
 	}
 
+	var strMethods []string
 	for _, fname := range files {
 		fErr := func() error {
 			if isTestFile(fname) {
@@ -82,25 +53,25 @@ func FindMethods(req Request) (methods []string, err error) {
 
 			f, fErr := fs.Open(fname)
 			if fErr != nil {
-				return fmt.Errorf("failed to open '%s': %w", fname, err)
+				return fmt.Errorf("failed to open: %w", err)
 			}
 			defer f.Close()
 
 			b, rErr := io.ReadAll(f)
 			if err != nil {
-				return fmt.Errorf("failed to read '%s': %w", fname, rErr)
+				return fmt.Errorf("failed to read: %w", rErr)
 			}
 
-			if !isInPackage(b) {
+			if !fileIsInPackage(b) {
 				return nil
 			}
 
-			methods = append(methods, interfaceMethods(b)...)
+			strMethods = append(strMethods, interfaceMethods(b)...)
 
 			return nil
 		}()
 		if fErr != nil {
-			err = errors.Join(err, fErr)
+			err = errors.Join(err, fmt.Errorf("failed to process '%s': %w", fname, err))
 		}
 	}
 
@@ -108,143 +79,50 @@ func FindMethods(req Request) (methods []string, err error) {
 		return nil, err
 	}
 
-	sort.Strings(methods)
-	return methods, nil
+	sort.Strings(strMethods)
+	return parseMethods(strMethods, req.Package), nil
 }
 
-func Generate(req Request) error {
-	// w := bytes.NewBuffer(nil)
+func (m *mocker) Generate(re api.RequestGET) (r io.Reader, err error) {
+	req := request{RequestGET: re}
 
-	return ifaceTmpl.ExecuteTemplate(os.Stdout, "mock.tmpl.go", req)
-}
-
-const captureFuncName = `^([A-Z][a-zA-Z0-9_]+)`
-
-var reCaptureFuncName = regexp.MustCompile(captureFuncName)
-
-const captureRequestParams = `\((.+)\)\s+.+$`
-
-var reCaptureRequestParams = regexp.MustCompile(captureRequestParams)
-
-// FIXME: https://go.dev/play/p/I5GRnC_cBGK.go
-var reCaptureSignatureParts = regexp.MustCompile(`^([A-Z][a-zA-Z0-9_]+)\((.+)?\)\s+\(?(.+)?\)?\s*$`)
-
-var returnsVoid = func() func(string) bool {
-	re := regexp.MustCompile(`\(.*\)\s.+$`)
-	return func(sig string) bool {
-		return !re.MatchString(sig)
-	}
-}()
-
-func funcName(sig string) string { return reCaptureFuncName.FindStringSubmatch(sig)[1] }
-
-func getCalledWithType(sig string) string {
-	matches := reCaptureRequestParams.FindStringSubmatch(sig)
-	if len(matches) == 0 {
-		return ""
+	fs, err := gofs.New(req.Module)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize file system: %w", err)
 	}
 
-	paramList := strings.Split(matches[1], ",")
-	if len(paramList) > 1 {
-		return funcName(sig) + "Input"
+	defer fs.Done()
+
+	req.Methods, err = getMethods(fs, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read package methods: %w", err)
 	}
 
-	t := strings.Split(strings.TrimSpace(paramList[0]), " ")[1]
-	return strings.Replace(t, "...", "[]", 1)
-}
-
-func getCalledWithAppend(sig string) string {
-	matches := reCaptureRequestParams.FindStringSubmatch(sig)
-	if len(matches) == 0 {
-		return ""
+	if err = writeTemplateToWorkDir(fs, req); err != nil {
+		return nil, fmt.Errorf("failed to generate %s %s: %w", req.Type, req.To, err)
 	}
 
-	params := splitParams(matches[1])
-	if len(params) == 1 {
-		p, _ := splitParam(params[0])
-		return p
-	}
-	b := new(strings.Builder)
-	fmt.Fprintf(b, "%sInput{\n", funcName(sig))
+	goimports := exec.Command("goimports", "-local", req.Module, ".")
+	goimports.Dir = fs.WorkDir()
 
-	lpad := 0
-	for _, param := range params {
-		p, _ := splitParam(param)
-		if len(p) > lpad {
-			lpad = len(p)
-		}
+	w, wErr := bytes.NewBuffer(nil), bytes.NewBuffer(nil)
+
+	goimports.Stdout = w
+	goimports.Stderr = wErr
+
+	if err = goimports.Run(); err != nil {
+		b, _ := io.ReadAll(wErr)
+		return nil, fmt.Errorf("failed to format files: %s %w", string(b), err)
 	}
 
-	for _, param := range params {
-		p, _ := splitParam(param)
-		fmt.Fprintf(b, "\t\t%s%s: %"+fmt.Sprint(lpad)+"s,\n", strings.ToUpper(string(p[0])), p[1:], p)
-	}
-	fmt.Fprint(b, "\t}")
-	return b.String()
-}
-
-func getInputStruct(sig string) string {
-	matches := reCaptureRequestParams.FindStringSubmatch(sig)
-	if len(matches) == 0 {
-		return ""
+	cmdErrBytes, err := io.ReadAll(wErr)
+	if len(cmdErrBytes) > 0 || err != nil {
+		return nil, fmt.Errorf("failed to read goimports err output: %s %w", string(cmdErrBytes), err)
 	}
 
-	params := splitParams(matches[1])
-	if len(params) == 1 {
-		return ""
+	if len(cmdErrBytes) > 0 {
+		return nil, fmt.Errorf("goimports was unsuccessful: %s", string(cmdErrBytes))
 	}
 
-	b := new(strings.Builder)
-	fmt.Fprintf(b, "type %sInput struct {\n", funcName(sig))
-
-	lpad := 0
-	for _, param := range params {
-		p, _ := splitParam(param)
-		if len(p) > lpad {
-			lpad = len(p)
-		}
-	}
-
-	for _, param := range params {
-		p, t := splitParam(param)
-		msg := "\t%s%s %" + fmt.Sprint(lpad) + "s\n"
-		t = strings.Replace(t, "...", "[]", 1)
-		fmt.Fprintf(b, msg, strings.ToUpper(string(p[0])), p[1:], t)
-	}
-	fmt.Fprint(b, "}")
-
-	return b.String()
-}
-
-func getParams(sig string) string {
-	matches := reCaptureRequestParams.FindStringSubmatch(sig)
-	if len(matches) == 0 {
-		return ""
-	}
-
-	paramList := splitParams(matches[1])
-
-	params := make([]string, len(paramList))
-	for i, param := range paramList {
-		p, t := splitParam(param)
-		if isVariadic(t) {
-			p = p + "..."
-		}
-		params[i] = p
-	}
-	return strings.Join(params, ", ")
-}
-
-func isVariadic(t string) bool { return strings.HasPrefix(t, "...") }
-func splitParams(s string) []string {
-	return strings.Split(strings.TrimSpace(s), ",")
-}
-func splitParam(s string) (p, t string) {
-	parts := strings.Split(strings.TrimSpace(s), " ")
-	return parts[0], parts[1]
-}
-
-// TODO
-func exportSignatureTypes(sig, pkg string) string {
-	return ""
+	return w, nil
 }
